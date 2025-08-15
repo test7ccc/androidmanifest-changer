@@ -6,12 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
-	"path"
-	"path/filepath"
 	"strings"
 
 	"google.golang.org/protobuf/proto"
@@ -37,7 +34,7 @@ func main() {
 	packageName := flag.String("package", "", "The package to set")
 	flag.Parse()
 	if len(flag.Args()) != 1 {
-		fmt.Fprintln(flag.CommandLine.Output(), "Error: File path is required.")
+		fmt.Fprintln(flag.CommandLine.Output(), "Error: File filePath is required.")
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -47,19 +44,19 @@ func main() {
 		packageName: *packageName,
 	}
 
-	path := flag.Arg(0)
+	filePath := flag.Arg(0)
 
-	if strings.HasSuffix(path, ".apk") {
-		updateApk(path, config)
-	} else if strings.HasSuffix(path, ".aab") {
-		updateAab(path, config)
+	if strings.HasSuffix(filePath, ".apk") {
+		updateApk(filePath, config)
+	} else if strings.HasSuffix(filePath, ".aab") {
+		updateAab(filePath, config)
 	} else {
-		updateManifest(path, config)
+		updateManifest(filePath, config)
 	}
 }
 
 func updateApk(path string, config *Config) {
-	file, err := ioutil.TempFile(tmpDir, "*.aar")
+	file, err := os.CreateTemp(tmpDir, "*.aar")
 	if err != nil {
 		log.Fatalln("Failed creating temp file:", err)
 	}
@@ -83,7 +80,7 @@ func updateAab(path string, config *Config) {
 }
 
 func updateManifestPbInZip(path string, manifestPath string, config *Config) {
-	manifest, err := ioutil.TempFile(tmpDir, "AndroidManifest.*.xml")
+	manifest, err := os.CreateTemp(tmpDir, "AndroidManifest.*.xml")
 	if err != nil {
 		log.Fatalln("Failed creating temp file:", err)
 	}
@@ -91,36 +88,8 @@ func updateManifestPbInZip(path string, manifestPath string, config *Config) {
 
 	extractFromZip(path, manifestPath, manifest)
 	updateManifest(manifest.Name(), config)
-	addToZip(path, manifestPath, manifest)
-}
-
-func addToZip(zipPath string, name string, source *os.File) {
-	manifestDir, err := ioutil.TempDir(tmpDir, "*")
-	if err != nil {
-		log.Fatalln("Failed creating temp dir:", err)
-	}
-	defer os.RemoveAll(manifestDir)
-
-	tmpPath := path.Join(manifestDir, name)
-	os.MkdirAll(path.Dir(tmpPath), 0700)
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		log.Fatalln("Failed opening file:", err)
-	}
-	defer f.Close()
-	source.Seek(0, 0)
-	io.Copy(f, source)
-
-	absZipPath, err := filepath.Abs(zipPath)
-	if err != nil {
-		log.Fatal(err)
-	}
-	cmd := exec.Command("zip", absZipPath, name)
-	cmd.Dir = manifestDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Fatalln("Failed executing zip:", err, string(out))
-	}
+	// 使用新的原生Go实现替代外部zip命令
+	addToZipNative(path, manifestPath, manifest)
 }
 
 func extractFromZip(path string, name string, target *os.File) {
@@ -157,7 +126,7 @@ func findFile(r *zip.ReadCloser, name string) *zip.File {
 }
 
 func updateManifest(path string, config *Config) {
-	in, err := ioutil.ReadFile(path)
+	in, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatalln("Error reading file:", err)
 	}
@@ -203,7 +172,80 @@ func updateManifest(path string, config *Config) {
 	if err != nil {
 		log.Fatalln("Error marshalling XML:", err)
 	}
-	if err := ioutil.WriteFile(path, out, 0600); err != nil {
+	if err := os.WriteFile(path, out, 0600); err != nil {
 		log.Fatalln("Error writing file:", err)
+	}
+}
+
+// addToZipNative 使用Go内置zip包替代外部zip命令
+// zipPath: 目标zip文件路径
+// fileName: 要添加到zip中的文件名
+// source: 源文件
+func addToZipNative(zipPath string, fileName string, source *os.File) {
+	// 读取现有zip文件的所有内容
+	existingFiles := make(map[string][]byte)
+
+	// 如果zip文件存在，先读取所有现有文件
+	if _, err := os.Stat(zipPath); err == nil {
+		reader, err := zip.OpenReader(zipPath)
+		if err != nil {
+			log.Fatalln("Failed opening zip for reading:", err)
+		}
+		defer reader.Close()
+
+		for _, file := range reader.File {
+			// 跳过要更新的文件
+			if file.Name == fileName {
+				continue
+			}
+
+			rc, err := file.Open()
+			if err != nil {
+				log.Fatalln("Failed opening file in zip:", err)
+			}
+
+			data, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				log.Fatalln("Failed reading file from zip:", err)
+			}
+
+			existingFiles[file.Name] = data
+		}
+	}
+
+	// 创建新的zip文件
+	zipFile, err := os.Create(zipPath)
+	if err != nil {
+		log.Fatalln("Failed creating zip file:", err)
+	}
+	defer zipFile.Close()
+
+	zipWriter := zip.NewWriter(zipFile)
+	defer zipWriter.Close()
+
+	// 写入所有现有文件
+	for name, data := range existingFiles {
+		writer, err := zipWriter.Create(name)
+		if err != nil {
+			log.Fatalln("Failed creating file in zip:", err)
+		}
+
+		_, err = writer.Write(data)
+		if err != nil {
+			log.Fatalln("Failed writing file to zip:", err)
+		}
+	}
+
+	// 添加新文件
+	writer, err := zipWriter.Create(fileName)
+	if err != nil {
+		log.Fatalln("Failed creating new file in zip:", err)
+	}
+
+	source.Seek(0, 0)
+	_, err = io.Copy(writer, source)
+	if err != nil {
+		log.Fatalln("Failed copying file to zip:", err)
 	}
 }
